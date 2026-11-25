@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 
+from backend.settings import router as settings_router
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIRECTORY = PROJECT_ROOT / "logs"
 LOG_DIRECTORY.mkdir(exist_ok=True)
@@ -40,6 +42,7 @@ if not any(
 
 app = FastAPI(title="JARVIS")
 app.state.listening_enabled = True
+app.include_router(settings_router)
 
 
 def _is_loopback(request: Request) -> bool:
