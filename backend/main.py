@@ -39,6 +39,7 @@ if not any(
     logger.addHandler(file_handler)
 
 app = FastAPI(title="JARVIS")
+app.state.listening_enabled = True
 
 
 def _is_loopback(request: Request) -> bool:
@@ -94,6 +95,16 @@ def shutdown(request: Request, background_tasks: BackgroundTasks) -> dict[str, s
         raise HTTPException(status_code=403, detail="Local requests only")
     background_tasks.add_task(_signal_shutdown)
     return {"status": "shutting_down"}
+
+
+@app.post("/api/listening")
+def toggle_listening(request: Request) -> dict[str, bool]:
+    """Toggle the placeholder listening state for the future voice integration."""
+    if not _is_loopback(request):
+        raise HTTPException(status_code=403, detail="Local requests only")
+    app.state.listening_enabled = not app.state.listening_enabled
+    logger.info("Listening enabled: %s", app.state.listening_enabled)
+    return {"listening": app.state.listening_enabled}
 
 
 frontend_dist = PROJECT_ROOT / "frontend" / "dist"

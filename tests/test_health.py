@@ -82,6 +82,24 @@ def test_shutdown_rejects_non_local_client() -> None:
     assert response.status_code == 403
 
 
+def test_listening_endpoint_toggles_local_state() -> None:
+    app.state.listening_enabled = True
+
+    first_response = client.post("/api/listening")
+    second_response = client.post("/api/listening")
+
+    assert first_response.json() == {"listening": False}
+    assert second_response.json() == {"listening": True}
+
+
+def test_listening_endpoint_rejects_non_local_client() -> None:
+    remote_client = TestClient(app, client=("192.0.2.1", 50000))
+
+    response = remote_client.post("/api/listening")
+
+    assert response.status_code == 403
+
+
 def test_frontend_is_served_when_built() -> None:
     response = client.get("/")
 
