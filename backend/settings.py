@@ -99,6 +99,31 @@ def run_task_script(script_name: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_powershell_command(script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+        check=True,
+        creationflags=CREATE_NO_WINDOW,
+        startupinfo=_hidden_startupinfo(),
+        shell=False,
+    )
+
+
 def _query_autostart_status() -> dict[str, bool | str | int]:
     script = (
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
@@ -197,6 +222,22 @@ def _query_autostart_status() -> dict[str, bool | str | int]:
     }
 
 
+def set_autostart_enabled(enabled: bool) -> None:
+    task = _query_autostart_status()
+    if not task["registered"]:
+        if enabled:
+            run_task_script("register_autostart.ps1")
+        return
+    if task["enabled"] is enabled:
+        return
+    command = (
+        "Enable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+        if enabled
+        else "Disable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+    )
+    run_powershell_command(command)
+
+
 def invalidate_autostart_status_cache() -> None:
     global _status_cache, _status_generation
     with _status_cache_lock:
@@ -273,9 +314,6 @@ def read_autostart(
 def request_autostart_change(request: Request, body: AutoStartUpdate) -> dict[str, object]:
     if not _is_loopback(request):
         raise HTTPException(status_code=403, detail="Local requests only")
-    script_name = (
-        "register_autostart.ps1" if body.enabled else "unregister_autostart.ps1"
-    )
     action = "enable_autostart" if body.enabled else "disable_autostart"
     description = (
         "Register JARVIS to start when the current user signs in."
@@ -285,7 +323,7 @@ def request_autostart_change(request: Request, body: AutoStartUpdate) -> dict[st
 
     def execute_change() -> None:
         try:
-            run_task_script(script_name)
+            set_autostart_enabled(body.enabled)
         finally:
             invalidate_autostart_status_cache()
 
@@ -322,7 +360,12 @@ def approve_request(request: Request, approval_id: str) -> dict[str, dict[str, s
         return {"approval": approval_manager.approve(approval_id)}
     except (ApprovalNotFound, ApprovalExpired, ApprovalNotPending) as error:
         raise _approval_error(error) from error
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
+    except (
+        AutostartStatusQueryError,
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as error:
         logger.exception("Approved action failed: id=%s", approval_id)
         raise HTTPException(status_code=503, detail="Approved action failed") from error
 
