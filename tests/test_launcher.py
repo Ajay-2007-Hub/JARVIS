@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -79,6 +80,8 @@ def test_start_backend_redirects_output_and_disables_console(
     assert backend_log.encoding == "utf-8"
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["creationflags"] == launcher.CREATE_NO_WINDOW
+    assert kwargs["cwd"] == launcher.PROJECT_ROOT
+    assert kwargs["env"]["PYTHONPATH"] == str(launcher.PROJECT_ROOT)
     assert "--no-use-colors" in mock_popen.call_args.args[0]
     assert backend_log.closed
 
@@ -125,6 +128,27 @@ def test_backend_replaces_missing_standard_streams_in_fresh_process() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_launcher_script_imports_tray_from_unrelated_working_directory(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(launcher.PROJECT_ROOT / "scripts" / "launcher.py"),
+            "--check-imports",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_find_browser_uses_configured_then_installed_then_path_order(

@@ -18,6 +18,10 @@ import requests
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT_STRING = str(PROJECT_ROOT)
+if PROJECT_ROOT_STRING not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT_STRING)
+
 LOG_DIRECTORY = Path(
     os.getenv("JARVIS_LOG_DIRECTORY", str(PROJECT_ROOT / "logs"))
 )
@@ -232,10 +236,13 @@ def backend_command() -> list[str]:
 def start_backend() -> subprocess.Popen[bytes]:
     logger.info("Starting JARVIS backend")
     backend_log_path = LOG_DIRECTORY / "backend.log"
+    backend_env = os.environ.copy()
+    backend_env["PYTHONPATH"] = PROJECT_ROOT_STRING
     with backend_log_path.open("a", encoding="utf-8") as backend_log:
         return subprocess.Popen(
             backend_command(),
             cwd=PROJECT_ROOT,
+            env=backend_env,
             stdin=subprocess.DEVNULL,
             stdout=backend_log,
             stderr=backend_log,
@@ -342,11 +349,15 @@ def shutdown_requested() -> bool:
     return SHUTDOWN_MARKER.is_file()
 
 
+def load_tray() -> Callable[[], None]:
+    from backend.tray import run_tray
+
+    return run_tray
+
+
 def _run_tray() -> None:
     try:
-        from backend.tray import run_tray
-
-        run_tray()
+        load_tray()()
     except Exception:
         logger.exception("System tray failed")
 
@@ -463,4 +474,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--check-imports" in sys.argv[1:]:
+        load_tray()
+        raise SystemExit(0)
     raise SystemExit(main())
