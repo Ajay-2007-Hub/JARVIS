@@ -1,6 +1,7 @@
 """Windows system-tray controls for the local JARVIS application."""
 
 import logging
+import os
 import shutil
 import subprocess
 import webbrowser
@@ -13,7 +14,9 @@ from PIL import Image, ImageDraw
 from pystray import Menu, MenuItem
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIRECTORY = PROJECT_ROOT / "logs"
+LOG_DIRECTORY = Path(
+    os.getenv("JARVIS_LOG_DIRECTORY", str(PROJECT_ROOT / "logs"))
+)
 LOG_DIRECTORY.mkdir(exist_ok=True)
 BACKEND_URL = "http://127.0.0.1:8000"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)

@@ -66,11 +66,17 @@ def test_chat_endpoint_is_a_placeholder() -> None:
 
 
 @patch("backend.main._signal_shutdown")
-def test_shutdown_schedules_graceful_shutdown(mock_shutdown: Mock) -> None:
+def test_shutdown_schedules_graceful_shutdown(
+    mock_shutdown: Mock, tmp_path, monkeypatch
+) -> None:
+    marker = tmp_path / "shutdown.requested"
+    monkeypatch.setattr("backend.main.SHUTDOWN_MARKER", marker)
+
     response = client.post("/api/shutdown")
 
     assert response.status_code == 200
     assert response.json() == {"status": "shutting_down"}
+    assert marker.read_text(encoding="utf-8") == "shutdown requested\n"
     mock_shutdown.assert_called_once_with()
 
 

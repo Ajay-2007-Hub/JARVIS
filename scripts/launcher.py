@@ -30,6 +30,7 @@ BACKEND_URL = "http://127.0.0.1:8000"
 MAX_RESTARTS = 3
 RESTART_DELAY_SECONDS = 10
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SHUTDOWN_MARKER = LOG_DIRECTORY / "shutdown.requested"
 
 logger = logging.getLogger("jarvis.launcher")
 logger.setLevel(logging.INFO)
@@ -84,6 +85,80 @@ def find_ollama() -> str | None:
         candidate = Path(local_app_data) / "Programs" / "Ollama" / "ollama.exe"
         if candidate.is_file():
             return str(candidate)
+    return None
+
+
+def find_browser() -> str | None:
+    candidates: list[Path] = []
+    configured_browser = os.getenv("BROWSER_PATH")
+    if configured_browser:
+        configured_path = Path(
+            os.path.expandvars(os.path.expanduser(configured_browser))
+        )
+        if not configured_path.is_absolute():
+            configured_path = PROJECT_ROOT / configured_path
+        candidates.append(configured_path)
+
+    program_files_x86 = os.getenv("ProgramFiles(x86)")
+    program_files = os.getenv("ProgramFiles")
+    local_app_data = os.getenv("LOCALAPPDATA")
+
+    if program_files_x86:
+        candidates.append(
+            Path(program_files_x86)
+            / "Microsoft"
+            / "Edge"
+            / "Application"
+            / "msedge.exe"
+        )
+    if program_files:
+        candidates.append(
+            Path(program_files)
+            / "Microsoft"
+            / "Edge"
+            / "Application"
+            / "msedge.exe"
+        )
+        candidates.append(
+            Path(program_files)
+            / "BraveSoftware"
+            / "Brave-Browser"
+            / "Application"
+            / "brave.exe"
+        )
+    if local_app_data:
+        candidates.append(
+            Path(local_app_data)
+            / "BraveSoftware"
+            / "Brave-Browser"
+            / "Application"
+            / "brave.exe"
+        )
+    if program_files_x86:
+        candidates.append(
+            Path(program_files_x86)
+            / "Google"
+            / "Chrome"
+            / "Application"
+            / "chrome.exe"
+        )
+    if program_files:
+        candidates.append(
+            Path(program_files)
+            / "Google"
+            / "Chrome"
+            / "Application"
+            / "chrome.exe"
+        )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    for browser in ("msedge", "brave", "chrome"):
+        browser_path = shutil.which(browser)
+        if browser_path:
+            return browser_path
     return None
 
 
@@ -200,19 +275,35 @@ def wait_for_backend(process: subprocess.Popen[bytes], timeout: float = 90) -> b
 
 
 def open_jarvis() -> None:
-    logger.info("Opening JARVIS window")
-    edge = shutil.which("msedge")
-    if edge:
+    browser_path = find_browser()
+    if browser_path:
+        logger.info("Opening UI via %s", browser_path)
         try:
             subprocess.Popen(
-                [edge, f"--app={BACKEND_URL}"],
+                [browser_path, f"--app={BACKEND_URL}"],
                 cwd=PROJECT_ROOT,
                 creationflags=CREATE_NO_WINDOW,
             )
+        except Exception:
+            logger.warning(
+                "Could not open UI via %s; trying the default browser",
+                browser_path,
+                exc_info=True,
+            )
+        else:
+            logger.info("UI opened")
             return
-        except OSError:
-            logger.exception("Could not launch Edge; using the default browser")
-    webbrowser.open(BACKEND_URL)
+
+    logger.info("Opening UI via default browser")
+    try:
+        opened = webbrowser.open(BACKEND_URL)
+    except Exception:
+        logger.warning("Could not open UI via the default browser", exc_info=True)
+    else:
+        if opened:
+            logger.info("UI opened")
+        else:
+            logger.warning("The default browser did not open the JARVIS UI")
 
 
 def show_failure_toast() -> None:
@@ -243,12 +334,60 @@ def should_restart(restarts_used: int) -> bool:
     return restarts_used < MAX_RESTARTS
 
 
+def clear_shutdown_request() -> None:
+    SHUTDOWN_MARKER.unlink(missing_ok=True)
+
+
+def shutdown_requested() -> bool:
+    return SHUTDOWN_MARKER.is_file()
+
+
+def _run_tray() -> None:
+    try:
+        from backend.tray import run_tray
+
+        run_tray()
+    except Exception:
+        logger.exception("System tray failed")
+
+
+def start_tray() -> None:
+    try:
+        tray_thread = threading.Thread(
+            target=_run_tray,
+            name="jarvis-tray",
+            daemon=True,
+        )
+        tray_thread.start()
+    except Exception:
+        logger.exception("Could not start system tray")
+    else:
+        logger.info("Tray started")
+
+
+def supervise_existing_backend() -> int:
+    while True:
+        if shutdown_requested():
+            logger.info("Shutdown requested; stopping JARVIS launcher")
+            return 0
+        if not is_backend_running():
+            if shutdown_requested():
+                logger.info("Shutdown requested; stopping JARVIS launcher")
+                return 0
+            logger.error("Existing JARVIS backend stopped without a shutdown request")
+            return 1
+        time.sleep(1)
+
+
 def run() -> int:
     if is_backend_running():
-        logger.info("JARVIS backend already responds; opening existing instance")
+        logger.info("JARVIS backend already responds")
         open_jarvis()
-        return 0
+        start_tray()
+        logger.info("Supervising backend")
+        return supervise_existing_backend()
 
+    clear_shutdown_request()
     if not ensure_ollama():
         return 1
 
@@ -266,18 +405,19 @@ def run() -> int:
             stop_backend(process)
         else:
             if not tray_started:
-                from backend.tray import run_tray
-
-                threading.Thread(
-                    target=run_tray,
-                    name="jarvis-tray",
-                    daemon=True,
-                ).start()
+                start_tray()
                 tray_started = True
                 open_jarvis()
+            logger.info("Supervising backend")
             process.wait()
+            if shutdown_requested():
+                logger.info("Shutdown requested; stopping JARVIS launcher")
+                return 0
             logger.warning("JARVIS backend exited with status %s", process.returncode)
 
+        if shutdown_requested():
+            logger.info("Shutdown requested; stopping JARVIS launcher")
+            return 0
         if not should_restart(restarts_used):
             show_failure_toast()
             return 1
@@ -292,5 +432,35 @@ def run() -> int:
         time.sleep(RESTART_DELAY_SECONDS)
 
 
+def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
+    logger.error(
+        "Uncaught launcher exception",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
+def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+    thread_name = args.thread.name if args.thread else "unknown"
+    logger.error(
+        "Uncaught exception in thread %s",
+        thread_name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def install_exception_hooks() -> None:
+    sys.excepthook = _log_uncaught_exception
+    threading.excepthook = _log_thread_exception
+
+
+def main() -> int:
+    try:
+        install_exception_hooks()
+        return run()
+    except Exception:
+        logger.exception("JARVIS launcher failed")
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(main())

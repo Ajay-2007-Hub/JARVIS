@@ -25,6 +25,7 @@ LOG_DIRECTORY = Path(
     os.getenv("JARVIS_LOG_DIRECTORY", str(PROJECT_ROOT / "logs"))
 )
 LOG_DIRECTORY.mkdir(exist_ok=True)
+SHUTDOWN_MARKER = LOG_DIRECTORY / "shutdown.requested"
 load_dotenv(PROJECT_ROOT / ".env")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -47,6 +48,11 @@ if not any(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
     logger.addHandler(file_handler)
+
+try:
+    SHUTDOWN_MARKER.unlink(missing_ok=True)
+except OSError:
+    logger.exception("Could not clear previous shutdown request marker")
 
 app = FastAPI(title="JARVIS")
 app.state.listening_enabled = True
@@ -105,6 +111,14 @@ def shutdown(request: Request, background_tasks: BackgroundTasks) -> dict[str, s
     """Request graceful shutdown from a local client."""
     if not _is_loopback(request):
         raise HTTPException(status_code=403, detail="Local requests only")
+    try:
+        SHUTDOWN_MARKER.write_text("shutdown requested\n", encoding="utf-8")
+    except OSError as error:
+        logger.exception("Could not record shutdown request")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not record shutdown request",
+        ) from error
     background_tasks.add_task(_signal_shutdown)
     return {"status": "shutting_down"}
 

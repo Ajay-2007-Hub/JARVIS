@@ -1,6 +1,7 @@
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -82,7 +83,9 @@ def test_start_backend_redirects_output_and_disables_console(
     assert backend_log.closed
 
 
+@patch("scripts.launcher.is_backend_running", return_value=False)
 def test_early_backend_exit_logs_status_and_last_twenty_lines(
+    mock_is_running: Mock,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -102,6 +105,7 @@ def test_early_backend_exit_logs_status_and_last_twenty_lines(
     assert "line 4" not in caplog.text
     assert "line 5" in caplog.text
     assert "line 24" in caplog.text
+    mock_is_running.assert_called_once_with()
 
 
 def test_backend_replaces_missing_standard_streams_in_fresh_process() -> None:
@@ -121,3 +125,140 @@ def test_backend_replaces_missing_standard_streams_in_fresh_process() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_find_browser_uses_configured_then_installed_then_path_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    program_files_x86 = tmp_path / "ProgramFiles86"
+    program_files = tmp_path / "ProgramFiles"
+    local_app_data = tmp_path / "LocalAppData"
+    configured = tmp_path / "configured-browser.exe"
+    expected_paths = [
+        configured,
+        program_files_x86 / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        program_files / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        program_files / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+        local_app_data / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+        program_files_x86 / "Google" / "Chrome" / "Application" / "chrome.exe",
+        program_files / "Google" / "Chrome" / "Application" / "chrome.exe",
+    ]
+    monkeypatch.setenv("BROWSER_PATH", str(configured))
+    monkeypatch.setenv("ProgramFiles(x86)", str(program_files_x86))
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    for candidate in expected_paths:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.touch()
+
+    for candidate in expected_paths:
+        assert launcher.find_browser() == str(candidate)
+        candidate.unlink()
+
+    mock_which = Mock(side_effect=[None, None, "C:/Chrome/chrome.exe"])
+    monkeypatch.setattr(launcher.shutil, "which", mock_which)
+    assert launcher.find_browser() == "C:/Chrome/chrome.exe"
+    assert [call.args[0] for call in mock_which.call_args_list] == [
+        "msedge",
+        "brave",
+        "chrome",
+    ]
+
+
+@patch("scripts.launcher.find_browser", return_value=None)
+@patch("scripts.launcher.webbrowser.open", return_value=True)
+def test_open_jarvis_falls_back_when_no_browser_is_found(
+    mock_open: Mock, mock_find_browser: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    launcher.open_jarvis()
+
+    mock_find_browser.assert_called_once_with()
+    mock_open.assert_called_once_with(launcher.BACKEND_URL)
+    assert "Opening UI via default browser" in caplog.text
+    assert "UI opened" in caplog.text
+
+
+def test_open_jarvis_launches_selected_browser_in_app_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_path = "C:/Program Files/Brave/brave.exe"
+    mock_popen = Mock()
+    monkeypatch.setattr(launcher, "find_browser", Mock(return_value=browser_path))
+    monkeypatch.setattr(launcher.subprocess, "Popen", mock_popen)
+
+    launcher.open_jarvis()
+
+    mock_popen.assert_called_once_with(
+        [browser_path, "--app=http://127.0.0.1:8000"],
+        cwd=launcher.PROJECT_ROOT,
+        creationflags=launcher.CREATE_NO_WINDOW,
+    )
+
+
+@patch("backend.tray.run_tray", side_effect=RuntimeError("tray failed"))
+def test_tray_failure_is_logged_without_escaping(
+    mock_run_tray: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    launcher._run_tray()
+
+    mock_run_tray.assert_called_once_with()
+    assert "System tray failed" in caplog.text
+    assert "RuntimeError: tray failed" in caplog.text
+
+
+def test_open_ui_failure_does_not_stop_supervision(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(launcher, "clear_shutdown_request", Mock())
+    monkeypatch.setattr(launcher, "is_backend_running", Mock(return_value=True))
+    monkeypatch.setattr(launcher, "find_browser", Mock(return_value=None))
+    monkeypatch.setattr(
+        launcher, "webbrowser", Mock(open=Mock(side_effect=OSError("browser failed")))
+    )
+    monkeypatch.setattr(launcher, "start_tray", Mock())
+    supervise = Mock(return_value=0)
+    monkeypatch.setattr(launcher, "supervise_existing_backend", supervise)
+
+    assert launcher.run() == 0
+
+    assert "Could not open UI via the default browser" in caplog.text
+    supervise.assert_called_once_with()
+
+
+def test_main_logs_unhandled_exception(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    monkeypatch.setattr(
+        launcher, "run", Mock(side_effect=RuntimeError("unexpected failure"))
+    )
+
+    assert launcher.main() == 1
+
+    assert "JARVIS launcher failed" in caplog.text
+    assert "RuntimeError: unexpected failure" in caplog.text
+    assert sys.excepthook is launcher._log_uncaught_exception
+    assert threading.excepthook is launcher._log_thread_exception
+
+
+def test_already_running_backend_is_supervised_until_shutdown(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(launcher, "clear_shutdown_request", Mock())
+    monkeypatch.setattr(launcher, "is_backend_running", Mock(return_value=True))
+    monkeypatch.setattr(
+        launcher, "shutdown_requested", Mock(side_effect=[False, False, True])
+    )
+    monkeypatch.setattr(launcher.time, "sleep", Mock())
+    monkeypatch.setattr(launcher, "open_jarvis", Mock())
+    monkeypatch.setattr(launcher, "start_tray", Mock())
+    start_backend = Mock()
+    monkeypatch.setattr(launcher, "start_backend", start_backend)
+
+    assert launcher.run() == 0
+
+    launcher.open_jarvis.assert_called_once_with()
+    launcher.start_tray.assert_called_once_with()
+    start_backend.assert_not_called()
+    assert "Supervising backend" in caplog.text
