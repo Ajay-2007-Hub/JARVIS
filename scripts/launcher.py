@@ -36,6 +36,14 @@ RESTART_DELAY_SECONDS = 10
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SHUTDOWN_MARKER = LOG_DIRECTORY / "shutdown.requested"
 
+
+def _hidden_startupinfo() -> subprocess.STARTUPINFO:
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return startupinfo
+
+
 logger = logging.getLogger("jarvis.launcher")
 logger.setLevel(logging.INFO)
 if not any(
@@ -182,6 +190,7 @@ def ensure_ollama() -> bool:
             [ollama_executable, "serve"],
             cwd=PROJECT_ROOT,
             creationflags=CREATE_NO_WINDOW,
+            startupinfo=_hidden_startupinfo(),
         )
     except OSError:
         logger.exception("Could not start Ollama")
@@ -247,6 +256,7 @@ def start_backend() -> subprocess.Popen[bytes]:
             stdout=backend_log,
             stderr=backend_log,
             creationflags=CREATE_NO_WINDOW,
+            startupinfo=_hidden_startupinfo(),
         )
 
 

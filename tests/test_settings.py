@@ -1,3 +1,7 @@
+import json
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
@@ -11,56 +15,320 @@ from backend.security.approval import ApprovalManager
 client = TestClient(app, client=("127.0.0.1", 50000))
 
 
+def status_json(
+    enabled: bool = True,
+    registered: bool = True,
+    state: str = "Ready",
+    last_result: int = 0,
+) -> str:
+    return json.dumps(
+        {
+            "registered": registered,
+            "enabled": enabled,
+            "state": state,
+            "last_result": last_result,
+        }
+    )
+
+
 @pytest.fixture(autouse=True)
 def reset_approval_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "approval_manager", ApprovalManager())
+    settings.invalidate_autostart_status_cache()
 
 
 @patch("backend.settings.subprocess.run")
-def test_status_script_reports_enabled(mock_run: Mock) -> None:
+def test_status_query_reports_enabled(mock_run: Mock) -> None:
     mock_run.return_value = CompletedProcess(
-        args=[], returncode=0, stdout="enabled=true\nlast_run_result=0\n", stderr=""
+        args=[],
+        returncode=0,
+        stdout=status_json(enabled=True, state="Ready", last_result=0),
+        stderr="",
     )
 
     response = client.get("/api/settings/autostart")
 
     assert response.status_code == 200
-    assert response.json() == {"enabled": True}
-    mock_run.assert_called_once_with(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(settings.SCRIPTS_DIRECTORY / "status_autostart.ps1"),
-        ],
-        cwd=settings.PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=True,
-    )
+    assert response.json() == {
+        "enabled": True,
+        "registered": True,
+        "state": "Ready",
+        "last_result": 0,
+    }
+    args, kwargs = mock_run.call_args
+    command = args[0]
+    assert command[0] == "powershell.exe"
+    assert command[1:8] == [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+    ]
+    assert kwargs["cwd"] == settings.PROJECT_ROOT
+    assert kwargs["timeout"] == 10
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["creationflags"] == settings.CREATE_NO_WINDOW
+    assert kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert kwargs["startupinfo"].wShowWindow == subprocess.SW_HIDE
+    assert kwargs["shell"] is False
+    assert "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8" in command[-1]
+    assert "Get-ScheduledTaskInfo -TaskName JARVIS" in command[-1]
 
 
 @patch("backend.settings.subprocess.run")
-def test_status_script_reports_disabled(mock_run: Mock) -> None:
+def test_status_query_reports_disabled(mock_run: Mock) -> None:
     mock_run.return_value = CompletedProcess(
-        args=[], returncode=0, stdout="enabled=false\n", stderr=""
+        args=[],
+        returncode=0,
+        stdout=status_json(enabled=False, state="Disabled", last_result=1),
+        stderr="",
     )
 
     response = client.get("/api/settings/autostart")
 
-    assert response.json() == {"enabled": False}
+    assert response.json() == {
+        "enabled": False,
+        "registered": True,
+        "state": "Disabled",
+        "last_result": 1,
+    }
 
 
-@patch("backend.settings.subprocess.run", side_effect=OSError("powershell missing"))
-def test_status_script_failure_is_reported(mock_run: Mock) -> None:
+@patch("backend.settings.subprocess.run")
+def test_not_registered_task_reports_disabled(mock_run: Mock) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout='{"registered":false,"enabled":false}',
+        stderr="",
+    )
+
     response = client.get("/api/settings/autostart")
 
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Could not read auto-start status"
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": False,
+        "registered": False,
+        "state": "Not registered",
+        "last_result": 0,
+    }
+
+
+@patch("backend.settings.subprocess.run")
+def test_malformed_status_json_returns_error_and_logs_output(
+    mock_run: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[], returncode=0, stdout="{not json", stderr="unexpected output"
+    )
+
+    response = client.get("/api/settings/autostart")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": None,
+        "error": "Invalid Task Scheduler status response",
+    }
+    assert "{not json" in caplog.text
+    assert "unexpected output" in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+
+
+@patch("backend.settings.subprocess.run")
+def test_status_query_timeout_returns_error_and_logs_output(
+    mock_run: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_run.side_effect = subprocess.TimeoutExpired(
+        cmd="powershell.exe", timeout=10, output="partial output", stderr="timed out"
+    )
+
+    response = client.get("/api/settings/autostart")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": None,
+        "error": "Task Scheduler status query timed out",
+    }
+    assert "partial output" in caplog.text
+    assert "timed out" in caplog.text
+
+
+@patch("backend.settings.subprocess.run")
+def test_status_query_accepts_utf8_bom(mock_run: Mock) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout="\ufeff" + status_json(enabled=True, state="Ready", last_result=2),
+        stderr="",
+    )
+
+    response = client.get("/api/settings/autostart")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": True,
+        "registered": True,
+        "state": "Ready",
+        "last_result": 2,
+    }
+
+
+@patch("backend.settings.subprocess.run")
+def test_status_is_cached(mock_run: Mock) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=status_json(enabled=True),
+        stderr="",
+    )
+
+    expected = {
+        "enabled": True,
+        "registered": True,
+        "state": "Ready",
+        "last_result": 0,
+    }
+    assert client.get("/api/settings/autostart").json() == expected
+    assert client.get("/api/settings/autostart").json() == expected
+
+    mock_run.assert_called_once()
+
+
+@patch("backend.settings.subprocess.run")
+def test_status_cache_expires_after_thirty_seconds(
+    mock_run: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=status_json(enabled=True),
+        stderr="",
+    )
+    clock = Mock(side_effect=[10.0, 11.0, 12.0, 42.0, 43.0])
+    monkeypatch.setattr(settings.time, "monotonic", clock)
+
+    assert settings.get_autostart_status()["enabled"] is True
+    assert settings.get_autostart_status()["enabled"] is True
+    assert settings.get_autostart_status()["enabled"] is True
+
+    assert mock_run.call_count == 2
+
+
+@patch("backend.settings.subprocess.run")
+def test_concurrent_status_requests_share_one_query(mock_run: Mock) -> None:
+    query_started = threading.Event()
+    release_query = threading.Event()
+
+    def run_query(*args, **kwargs) -> CompletedProcess[str]:
+        query_started.set()
+        if not release_query.wait(timeout=5):
+            raise TimeoutError("test query was not released")
+        return CompletedProcess(
+            args=[], returncode=0, stdout=status_json(enabled=True), stderr=""
+        )
+
+    mock_run.side_effect = run_query
+    barrier = threading.Barrier(6)
+
+    def request_status() -> dict[str, bool | str | int | None]:
+        barrier.wait()
+        return settings.get_autostart_status()
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        requests = [executor.submit(request_status) for _ in range(5)]
+        barrier.wait()
+        assert query_started.wait(timeout=5)
+        release_query.set()
+        responses = [request.result() for request in requests]
+
+    assert all(
+        response["enabled"] is True and response["registered"] is True
+        for response in responses
+    )
+    mock_run.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "initial_status", "updated_status", "script_name"),
+    [
+        (True, "Disabled", "Ready", "register_autostart.ps1"),
+        (False, "Ready", "Disabled", "unregister_autostart.ps1"),
+    ],
+)
+def test_approved_change_invalidates_status_cache(
+    enabled: bool,
+    initial_status: str,
+    updated_status: str,
+    script_name: str,
+) -> None:
+    with (
+        patch("backend.settings.subprocess.run") as mock_run,
+        patch("backend.settings.run_task_script") as mock_script,
+    ):
+        mock_run.side_effect = [
+            CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=status_json(
+                    enabled=initial_status != "Disabled",
+                    state=initial_status,
+                ),
+                stderr="",
+            ),
+            CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=status_json(
+                    enabled=updated_status != "Disabled",
+                    state=updated_status,
+                ),
+                stderr="",
+            ),
+        ]
+        assert client.get("/api/settings/autostart").json()["enabled"] is (
+            initial_status != "Disabled"
+        )
+        request = client.post(
+            "/api/settings/autostart", json={"enabled": enabled}
+        )
+        approval_id = request.json()["approval"]["id"]
+        response = client.post(f"/api/approvals/{approval_id}/approve")
+        assert response.status_code == 200
+        assert client.get("/api/settings/autostart").json()["enabled"] is (
+            updated_status != "Disabled"
+        )
+
+    mock_script.assert_called_once_with(script_name)
+    assert mock_run.call_count == 2
+
+
+@patch("backend.settings.subprocess.run")
+def test_powershell_scripts_run_hidden_without_a_shell(mock_run: Mock) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[], returncode=0, stdout="", stderr=""
+    )
+
+    settings.run_task_script("register_autostart.ps1")
+
+    args, kwargs = mock_run.call_args
+    assert args[0] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        str(settings.SCRIPTS_DIRECTORY / "register_autostart.ps1"),
+    ]
+    assert kwargs["creationflags"] == settings.CREATE_NO_WINDOW
+    assert kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert kwargs["startupinfo"].wShowWindow == subprocess.SW_HIDE
+    assert kwargs["shell"] is False
 
 
 def test_settings_endpoints_reject_non_local_clients() -> None:

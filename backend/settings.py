@@ -1,8 +1,12 @@
 """Local auto-start settings endpoints."""
 
 import ipaddress
+import json
 import logging
 import subprocess
+import threading
+import time
+from concurrent.futures import Future
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -21,10 +25,36 @@ logger = logging.getLogger("jarvis.settings")
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 approvals_router = APIRouter(prefix="/api/approvals", tags=["approvals"])
 approval_manager = ApprovalManager()
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+STATUS_CACHE_SECONDS = 30
+_status_cache: tuple[float, dict[str, bool | str | int]] | None = None
+_status_cache_lock = threading.Lock()
+_status_inflight: Future[dict[str, bool | str | int | None]] | None = None
+_status_generation = 0
+
+
+class AutostartStatusQueryError(Exception):
+    def __init__(
+        self,
+        reason: str,
+        stdout: str | bytes = "",
+        stderr: str | bytes = "",
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class AutoStartUpdate(BaseModel):
     enabled: bool
+
+
+def _hidden_startupinfo() -> subprocess.STARTUPINFO:
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return startupinfo
 
 
 def _is_loopback(request: Request) -> bool:
@@ -53,6 +83,8 @@ def run_task_script(script_name: str) -> subprocess.CompletedProcess[str]:
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
+            "-WindowStyle",
+            "Hidden",
             "-File",
             str(script_path),
         ],
@@ -61,31 +93,180 @@ def run_task_script(script_name: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=15,
         check=True,
+        creationflags=CREATE_NO_WINDOW,
+        startupinfo=_hidden_startupinfo(),
+        shell=False,
     )
 
 
-def get_autostart_status() -> bool:
-    result = run_task_script("status_autostart.ps1")
-    for line in result.stdout.splitlines():
-        if line.strip() == "enabled=true":
-            return True
-        if line.strip() == "enabled=false":
-            return False
-    raise ValueError("Auto-start status script returned no enabled value")
+def _query_autostart_status() -> dict[str, bool | str | int]:
+    script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$t = Get-ScheduledTask -TaskName JARVIS -ErrorAction SilentlyContinue; "
+        "if (-not $t) { '{\"registered\":false,\"enabled\":false}' } "
+        "else { $i = Get-ScheduledTaskInfo -TaskName JARVIS; "
+        "[pscustomobject]@{registered=$true; "
+        "enabled=[bool]$t.Settings.Enabled; state=[string]$t.State; "
+        "last_result=$i.LastTaskResult} | ConvertTo-Json -Compress }"
+    )
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        script,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=True,
+            creationflags=CREATE_NO_WINDOW,
+            startupinfo=_hidden_startupinfo(),
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AutostartStatusQueryError(
+            "Task Scheduler status query timed out",
+            error.stdout or error.output or "",
+            error.stderr or "",
+        ) from error
+    except Exception as error:
+        raise AutostartStatusQueryError(
+            "Task Scheduler status query failed",
+            getattr(error, "stdout", None) or getattr(error, "output", None) or "",
+            getattr(error, "stderr", None) or "",
+        ) from error
+
+    try:
+        payload = json.loads(result.stdout.lstrip("\ufeff"))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise AutostartStatusQueryError(
+            "Invalid Task Scheduler status response",
+            result.stdout,
+            result.stderr,
+        ) from error
+    if not isinstance(payload, dict):
+        raise AutostartStatusQueryError(
+            "Invalid Task Scheduler status response",
+            result.stdout,
+            result.stderr,
+        )
+
+    registered = payload.get("registered")
+    enabled = payload.get("enabled")
+    if not isinstance(registered, bool) or not isinstance(enabled, bool):
+        raise AutostartStatusQueryError(
+            "Invalid Task Scheduler status response",
+            result.stdout,
+            result.stderr,
+        )
+    if not registered:
+        return {
+            "enabled": False,
+            "registered": False,
+            "state": "Not registered",
+            "last_result": 0,
+        }
+
+    state = payload.get("state")
+    last_result = payload.get("last_result")
+    if (
+        not isinstance(state, str)
+        or not isinstance(last_result, int)
+        or isinstance(last_result, bool)
+    ):
+        raise AutostartStatusQueryError(
+            "Invalid Task Scheduler status response",
+            result.stdout,
+            result.stderr,
+        )
+    return {
+        "enabled": enabled,
+        "registered": True,
+        "state": state,
+        "last_result": last_result,
+    }
+
+
+def invalidate_autostart_status_cache() -> None:
+    global _status_cache, _status_generation
+    with _status_cache_lock:
+        _status_cache = None
+        _status_generation += 1
+
+
+def get_autostart_status() -> dict[str, bool | str | int | None]:
+    global _status_cache, _status_inflight
+    with _status_cache_lock:
+        now = time.monotonic()
+        if _status_cache is not None and now < _status_cache[0]:
+            return dict(_status_cache[1])
+        if _status_inflight is None:
+            _status_inflight = Future()
+            query = _status_inflight
+            query_owner = True
+            query_generation = _status_generation
+        else:
+            query = _status_inflight
+            query_owner = False
+            query_generation = _status_generation
+
+    if not query_owner:
+        return dict(query.result())
+
+    try:
+        result = _query_autostart_status()
+    except Exception as error:
+        if isinstance(error, AutostartStatusQueryError):
+            reason = error.reason
+            stdout = error.stdout
+            stderr = error.stderr
+        else:
+            reason = "Task Scheduler status query failed"
+            stdout = (
+                getattr(error, "stdout", None)
+                or getattr(error, "output", None)
+                or ""
+            )
+            stderr = getattr(error, "stderr", None) or ""
+        logger.exception(
+            "Could not read auto-start status: stdout=%r stderr=%r",
+            stdout,
+            stderr,
+        )
+        response: dict[str, bool | str | int | None] = {
+            "enabled": None,
+            "error": reason,
+        }
+        with _status_cache_lock:
+            _status_inflight = None
+            query.set_result(response)
+        return dict(response)
+
+    with _status_cache_lock:
+        if query_generation == _status_generation:
+            _status_cache = (time.monotonic() + STATUS_CACHE_SECONDS, result)
+        _status_inflight = None
+        query.set_result(result)
+    return dict(result)
 
 
 @router.get("/autostart")
-def read_autostart(request: Request) -> dict[str, bool]:
+def read_autostart(
+    request: Request,
+) -> dict[str, bool | str | int | None]:
     if not _is_loopback(request):
         raise HTTPException(status_code=403, detail="Local requests only")
-    try:
-        return {"enabled": get_autostart_status()}
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
-        logger.exception("Could not read auto-start status")
-        raise HTTPException(
-            status_code=503,
-            detail="Could not read auto-start status",
-        ) from error
+    return get_autostart_status()
 
 
 @router.post("/autostart", status_code=status.HTTP_202_ACCEPTED)
@@ -101,10 +282,17 @@ def request_autostart_change(request: Request, body: AutoStartUpdate) -> dict[st
         if body.enabled
         else "Remove JARVIS from the current user's sign-in startup."
     )
+
+    def execute_change() -> None:
+        try:
+            run_task_script(script_name)
+        finally:
+            invalidate_autostart_status_cache()
+
     approval = approval_manager.request(
         action=action,
         description=description,
-        execute=lambda: run_task_script(script_name),
+        execute=execute_change,
     )
     return {"approval": approval}
 

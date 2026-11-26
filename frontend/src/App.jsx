@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
@@ -13,12 +13,39 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [reply, setReply] = useState("");
   const [autoStartEnabled, setAutoStartEnabled] = useState(null);
+  const [autoStartError, setAutoStartError] = useState("");
+  const [autoStartLoading, setAutoStartLoading] = useState(true);
+  const [autoStartRequesting, setAutoStartRequesting] = useState(false);
+  const [autoStartApproval, setAutoStartApproval] = useState(null);
+  const autoStartApprovalRef = useRef(null);
   const [approvalOpen, setApprovalOpen] = useState(false);
   const [approvals, setApprovals] = useState([]);
   const [health, setHealth] = useState(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busyApproval, setBusyApproval] = useState("");
+
+  async function refreshAutoStartStatus(isActive = () => true) {
+    if (isActive()) setAutoStartLoading(true);
+    try {
+      const data = await fetchJson("/api/settings/autostart");
+      if (!isActive()) return;
+      if (typeof data.enabled !== "boolean") {
+        setAutoStartEnabled(null);
+        setAutoStartError(data.error || "Auto-start status is unavailable.");
+      } else {
+        setAutoStartEnabled(data.enabled);
+        setAutoStartError("");
+      }
+    } catch (requestError) {
+      if (isActive()) {
+        setAutoStartEnabled(null);
+        setAutoStartError(requestError.message);
+      }
+    } finally {
+      if (isActive()) setAutoStartLoading(false);
+    }
+  }
 
   useEffect(() => {
     let active = true;
@@ -41,26 +68,31 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    fetchJson("/api/settings/autostart")
-      .then((data) => {
-        if (active) setAutoStartEnabled(data.enabled);
-      })
-      .catch((requestError) => {
-        if (active) setError(requestError.message);
-      });
+    refreshAutoStartStatus(() => active);
     return () => {
       active = false;
     };
   }, []);
 
   useEffect(() => {
-    if (!approvalOpen) return undefined;
+    if (!approvalOpen && !autoStartApproval) return undefined;
     let active = true;
 
     async function refreshApprovals() {
       try {
         const data = await fetchJson("/api/approvals");
-        if (active) setApprovals(data.pending);
+        if (!active) return;
+        setApprovals(data.pending);
+        const trackedApproval = autoStartApprovalRef.current;
+        if (
+          trackedApproval &&
+          !data.pending.some((approval) => approval.id === trackedApproval.id)
+        ) {
+          autoStartApprovalRef.current = null;
+          await refreshAutoStartStatus();
+          setAutoStartApproval(null);
+          setNotice("Auto-start approval resolved.");
+        }
       } catch (requestError) {
         if (active) setError(requestError.message);
       }
@@ -72,7 +104,7 @@ export default function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [approvalOpen]);
+  }, [approvalOpen, autoStartApproval]);
 
   async function sendMessage(event) {
     event.preventDefault();
@@ -87,19 +119,27 @@ export default function App() {
   }
 
   async function requestAutoStartChange(event) {
+    if (autoStartApprovalRef.current || autoStartRequesting) return;
     const enabled = event.target.checked;
     setError("");
+    setAutoStartError("");
     setNotice("");
+    setAutoStartRequesting(true);
     try {
-      await fetchJson("/api/settings/autostart", {
+      const data = await fetchJson("/api/settings/autostart", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled }),
       });
-      setNotice("Approval requested. Approve the change to apply it.");
+      const pendingApproval = { id: data.approval.id, enabled };
+      autoStartApprovalRef.current = pendingApproval;
+      setAutoStartApproval(pendingApproval);
+      setNotice("Waiting for approval - open Review approvals");
       setApprovalOpen(true);
     } catch (requestError) {
       setError(requestError.message);
+    } finally {
+      setAutoStartRequesting(false);
     }
   }
 
@@ -119,11 +159,18 @@ export default function App() {
           ? `${data.approval.action.replaceAll("_", " ")} approved.`
           : "Approval denied.",
       );
-      if (data.approval.action === "enable_autostart" && decision === "approve") {
-        setAutoStartEnabled(true);
-      }
-      if (data.approval.action === "disable_autostart" && decision === "approve") {
-        setAutoStartEnabled(false);
+      const isAutoStartApproval =
+        data.approval.action === "enable_autostart" ||
+        data.approval.action === "disable_autostart";
+      if (isAutoStartApproval) {
+        if (decision === "approve") {
+          setAutoStartEnabled(data.approval.action === "enable_autostart");
+          setAutoStartError("");
+        }
+        if (autoStartApprovalRef.current?.id === approvalId) {
+          autoStartApprovalRef.current = null;
+          setAutoStartApproval(null);
+        }
       }
     } catch (requestError) {
       setError(requestError.message);
@@ -179,11 +226,28 @@ export default function App() {
             <input
               type="checkbox"
               role="switch"
-              checked={Boolean(autoStartEnabled)}
-              disabled={autoStartEnabled === null}
+              checked={
+                autoStartApproval
+                  ? autoStartApproval.enabled
+                  : Boolean(autoStartEnabled)
+              }
+              disabled={autoStartRequesting}
               onChange={requestAutoStartChange}
             />
           </label>
+          {autoStartError && (
+            <div className="autostart-error">
+              <p className="error" role="alert">{autoStartError}</p>
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={autoStartLoading}
+                onClick={() => refreshAutoStartStatus()}
+              >
+                {autoStartLoading ? "Retrying..." : "Retry"}
+              </button>
+            </div>
+          )}
         </div>
         <button className="secondary-button" onClick={() => setApprovalOpen(true)}>
           Review approvals
@@ -214,6 +278,11 @@ export default function App() {
                 ×
               </button>
             </div>
+            {autoStartApproval && (
+              <p className="notice" role="status">
+                Waiting for approval - open Review approvals
+              </p>
+            )}
             {approvals.length === 0 ? (
               <p className="empty">No pending approvals.</p>
             ) : (

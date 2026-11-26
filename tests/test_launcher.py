@@ -38,11 +38,12 @@ def test_starts_ollama_when_service_is_down(
 
     assert launcher.ensure_ollama()
 
-    mock_popen.assert_called_once_with(
-        ["C:/Ollama/ollama.exe", "serve"],
-        cwd=launcher.PROJECT_ROOT,
-        creationflags=launcher.CREATE_NO_WINDOW,
-    )
+    args, kwargs = mock_popen.call_args
+    assert args[0] == ["C:/Ollama/ollama.exe", "serve"]
+    assert kwargs["cwd"] == launcher.PROJECT_ROOT
+    assert kwargs["creationflags"] == launcher.CREATE_NO_WINDOW
+    assert kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert kwargs["startupinfo"].wShowWindow == subprocess.SW_HIDE
     mock_wait.assert_called_once()
 
 
@@ -80,6 +81,8 @@ def test_start_backend_redirects_output_and_disables_console(
     assert backend_log.encoding == "utf-8"
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["creationflags"] == launcher.CREATE_NO_WINDOW
+    assert kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert kwargs["startupinfo"].wShowWindow == subprocess.SW_HIDE
     assert kwargs["cwd"] == launcher.PROJECT_ROOT
     assert kwargs["env"]["PYTHONPATH"] == str(launcher.PROJECT_ROOT)
     assert "--no-use-colors" in mock_popen.call_args.args[0]
