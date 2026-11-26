@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
@@ -17,7 +18,9 @@ import requests
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIRECTORY = PROJECT_ROOT / "logs"
+LOG_DIRECTORY = Path(
+    os.getenv("JARVIS_LOG_DIRECTORY", str(PROJECT_ROOT / "logs"))
+)
 LOG_DIRECTORY.mkdir(exist_ok=True)
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -147,16 +150,22 @@ def backend_command() -> list[str]:
         "127.0.0.1",
         "--port",
         "8000",
+        "--no-use-colors",
     ]
 
 
 def start_backend() -> subprocess.Popen[bytes]:
     logger.info("Starting JARVIS backend")
-    return subprocess.Popen(
-        backend_command(),
-        cwd=PROJECT_ROOT,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    backend_log_path = LOG_DIRECTORY / "backend.log"
+    with backend_log_path.open("a", encoding="utf-8") as backend_log:
+        return subprocess.Popen(
+            backend_command(),
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=backend_log,
+            stderr=backend_log,
+            creationflags=CREATE_NO_WINDOW,
+        )
 
 
 def wait_for_backend(process: subprocess.Popen[bytes], timeout: float = 90) -> bool:
@@ -165,8 +174,25 @@ def wait_for_backend(process: subprocess.Popen[bytes], timeout: float = 90) -> b
         if is_backend_running():
             logger.info("JARVIS backend is healthy")
             return True
-        if process.poll() is not None:
-            logger.error("JARVIS backend exited before becoming healthy")
+        exit_code = process.poll()
+        if exit_code is not None:
+            logger.error(
+                "JARVIS backend exited before becoming healthy with status %s",
+                exit_code,
+            )
+            backend_log = LOG_DIRECTORY / "backend.log"
+            try:
+                with backend_log.open("r", encoding="utf-8", errors="replace") as log:
+                    log_tail = list(deque(log, maxlen=20))
+            except OSError:
+                logger.exception("Could not read backend log %s", backend_log)
+            else:
+                logger.error(
+                    "Last %s lines of %s:\n%s",
+                    len(log_tail),
+                    backend_log,
+                    "".join(log_tail).rstrip("\n") if log_tail else "(empty)",
+                )
             return False
         time.sleep(1)
     logger.error("JARVIS backend did not become healthy within 90 seconds")

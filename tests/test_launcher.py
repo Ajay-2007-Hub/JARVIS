@@ -1,5 +1,10 @@
+import logging
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
 import requests
 
 from scripts import launcher
@@ -55,3 +60,64 @@ def test_restart_limit_allows_three_restarts_only() -> None:
     assert launcher.should_restart(0)
     assert launcher.should_restart(2)
     assert not launcher.should_restart(3)
+
+
+@patch("scripts.launcher.subprocess.Popen")
+def test_start_backend_redirects_output_and_disables_console(
+    mock_popen: Mock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(launcher, "LOG_DIRECTORY", tmp_path)
+
+    launcher.start_backend()
+
+    kwargs = mock_popen.call_args.kwargs
+    backend_log = kwargs["stdout"]
+    assert kwargs["stderr"] is backend_log
+    assert backend_log.name == str(tmp_path / "backend.log")
+    assert backend_log.mode == "a"
+    assert backend_log.encoding == "utf-8"
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["creationflags"] == launcher.CREATE_NO_WINDOW
+    assert "--no-use-colors" in mock_popen.call_args.args[0]
+    assert backend_log.closed
+
+
+def test_early_backend_exit_logs_status_and_last_twenty_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(launcher, "LOG_DIRECTORY", tmp_path)
+    (tmp_path / "backend.log").write_text(
+        "\n".join(f"line {index}" for index in range(25)),
+        encoding="utf-8",
+    )
+    process = Mock()
+    process.poll.return_value = 23
+
+    with caplog.at_level(logging.ERROR, logger="jarvis.launcher"):
+        assert not launcher.wait_for_backend(process, timeout=1)
+
+    assert "status 23" in caplog.text
+    assert "line 4" not in caplog.text
+    assert "line 5" in caplog.text
+    assert "line 24" in caplog.text
+
+
+def test_backend_replaces_missing_standard_streams_in_fresh_process() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.stdout = None; sys.stderr = None; "
+                "import backend.main; "
+                "assert sys.stdout is not None and sys.stderr is not None"
+            ),
+        ],
+        cwd=launcher.PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

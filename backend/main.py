@@ -4,8 +4,14 @@ import ipaddress
 import logging
 import os
 import signal
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 import requests
 from dotenv import load_dotenv
@@ -15,7 +21,9 @@ from fastapi.staticfiles import StaticFiles
 from backend.settings import approvals_router, router as settings_router
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIRECTORY = PROJECT_ROOT / "logs"
+LOG_DIRECTORY = Path(
+    os.getenv("JARVIS_LOG_DIRECTORY", str(PROJECT_ROOT / "logs"))
+)
 LOG_DIRECTORY.mkdir(exist_ok=True)
 load_dotenv(PROJECT_ROOT / ".env")
 
