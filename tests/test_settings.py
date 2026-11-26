@@ -31,6 +31,15 @@ def status_json(
     )
 
 
+def scheduler_status(registered: bool, enabled: bool) -> dict[str, bool | str | int]:
+    return {
+        "enabled": enabled,
+        "registered": registered,
+        "state": "Ready" if enabled else "Disabled",
+        "last_result": 0,
+    }
+
+
 @pytest.fixture(autouse=True)
 def reset_approval_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "approval_manager", ApprovalManager())
@@ -265,28 +274,14 @@ def test_approved_change_invalidates_status_cache(
     script_name: str,
 ) -> None:
     with (
-        patch("backend.settings.subprocess.run") as mock_run,
+        patch("backend.settings._query_autostart_status") as mock_query,
+        patch("backend.settings.run_powershell_command") as mock_command,
         patch("backend.settings.run_task_script") as mock_script,
     ):
-        mock_run.side_effect = [
-            CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=status_json(
-                    enabled=initial_status != "Disabled",
-                    state=initial_status,
-                ),
-                stderr="",
-            ),
-            CompletedProcess(
-                args=[],
-                returncode=0,
-                stdout=status_json(
-                    enabled=updated_status != "Disabled",
-                    state=updated_status,
-                ),
-                stderr="",
-            ),
+        mock_query.side_effect = [
+            scheduler_status(True, initial_status != "Disabled"),
+            scheduler_status(True, initial_status != "Disabled"),
+            scheduler_status(True, updated_status != "Disabled"),
         ]
         assert client.get("/api/settings/autostart").json()["enabled"] is (
             initial_status != "Disabled"
@@ -301,8 +296,14 @@ def test_approved_change_invalidates_status_cache(
             updated_status != "Disabled"
         )
 
-    mock_script.assert_called_once_with(script_name)
-    assert mock_run.call_count == 2
+    expected_command = (
+        "Enable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+        if enabled
+        else "Disable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+    )
+    mock_command.assert_called_once_with(expected_command)
+    mock_script.assert_not_called()
+    assert mock_query.call_count == 3
 
 
 @patch("backend.settings.subprocess.run")
@@ -356,8 +357,14 @@ def test_post_creates_approval_without_changing_system() -> None:
     mock_script.assert_not_called()
 
 
+@patch(
+    "backend.settings._query_autostart_status",
+    return_value=scheduler_status(False, False),
+)
 @patch("backend.settings.run_task_script")
-def test_approved_settings_change_runs_register_script(mock_script: Mock) -> None:
+def test_approved_enable_registers_missing_task(
+    mock_script: Mock, mock_query: Mock
+) -> None:
     request_response = client.post(
         "/api/settings/autostart", json={"enabled": True}
     )
@@ -368,6 +375,111 @@ def test_approved_settings_change_runs_register_script(mock_script: Mock) -> Non
     assert approval_response.status_code == 200
     assert approval_response.json()["approval"]["status"] == "approved"
     mock_script.assert_called_once_with("register_autostart.ps1")
+    mock_query.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("current_enabled", "requested_enabled"),
+    [(True, True), (False, False)],
+)
+def test_already_desired_task_state_is_no_op(
+    current_enabled: bool, requested_enabled: bool
+) -> None:
+    with (
+        patch(
+            "backend.settings._query_autostart_status",
+            return_value=scheduler_status(True, current_enabled),
+        ) as mock_query,
+        patch("backend.settings.run_powershell_command") as mock_command,
+        patch("backend.settings.run_task_script") as mock_script,
+    ):
+        settings.set_autostart_enabled(requested_enabled)
+
+    mock_query.assert_called_once_with()
+    mock_command.assert_not_called()
+    mock_script.assert_not_called()
+
+
+def test_enable_existing_disabled_task_without_re_registering() -> None:
+    with (
+        patch(
+            "backend.settings._query_autostart_status",
+            return_value=scheduler_status(True, False),
+        ) as mock_query,
+        patch("backend.settings.run_powershell_command") as mock_command,
+        patch("backend.settings.run_task_script") as mock_script,
+    ):
+        settings.set_autostart_enabled(True)
+
+    mock_query.assert_called_once_with()
+    mock_command.assert_called_once_with(
+        "Enable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+    )
+    mock_script.assert_not_called()
+
+
+def test_disable_enabled_task_without_unregistering() -> None:
+    with (
+        patch(
+            "backend.settings._query_autostart_status",
+            return_value=scheduler_status(True, True),
+        ) as mock_query,
+        patch("backend.settings.run_powershell_command") as mock_command,
+        patch("backend.settings.run_task_script") as mock_script,
+    ):
+        settings.set_autostart_enabled(False)
+
+    mock_query.assert_called_once_with()
+    mock_command.assert_called_once_with(
+        "Disable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+    )
+    mock_script.assert_not_called()
+
+
+def test_disable_missing_task_is_no_op() -> None:
+    with (
+        patch(
+            "backend.settings._query_autostart_status",
+            return_value=scheduler_status(False, False),
+        ) as mock_query,
+        patch("backend.settings.run_powershell_command") as mock_command,
+        patch("backend.settings.run_task_script") as mock_script,
+    ):
+        settings.set_autostart_enabled(False)
+
+    mock_query.assert_called_once_with()
+    mock_command.assert_not_called()
+    mock_script.assert_not_called()
+
+
+@patch("backend.settings.subprocess.run")
+def test_scheduled_task_enable_command_runs_hidden_without_shell(
+    mock_run: Mock,
+) -> None:
+    mock_run.return_value = CompletedProcess(
+        args=[], returncode=0, stdout="", stderr=""
+    )
+
+    settings.run_powershell_command(
+        "Enable-ScheduledTask -TaskName JARVIS -ErrorAction Stop | Out-Null"
+    )
+
+    args, kwargs = mock_run.call_args
+    assert args[0][:8] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+    ]
+    assert args[0][-1].startswith("Enable-ScheduledTask")
+    assert kwargs["creationflags"] == settings.CREATE_NO_WINDOW
+    assert kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert kwargs["startupinfo"].wShowWindow == subprocess.SW_HIDE
+    assert kwargs["shell"] is False
 
 
 @patch("backend.settings.run_task_script")
